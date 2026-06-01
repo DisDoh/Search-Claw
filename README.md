@@ -7,7 +7,7 @@ It searches the web, opens result pages, and asks a local OpenAI-compatible LLM 
 The default setup uses:
 
 - Python for the Search Claw agent
-- DuckDuckGo HTML search as the search backend
+- DuckDuckGo Lite search as the search backend
 - `llama.cpp` server as the local model API
 - `whatsapp-web.js` for the WhatsApp bridge
 - `discord.js` for the Discord bridge
@@ -29,6 +29,23 @@ The default setup uses:
 - Works with a local `llama.cpp` OpenAI-compatible server
 - Simple source validation to reduce unsourced answers
 - Debug and verbose modes for troubleshooting
+
+---
+
+## Search Backend Notes
+
+Search Claw uses DuckDuckGo Lite/HTML by default. DuckDuckGo may temporarily return
+`202` or `429` for automated requests; when that happens, Search Claw reports that
+the search backend is blocked instead of inventing sources.
+
+Optional non-Google fallback:
+
+```bash
+SEARXNG_BASE_URL=http://127.0.0.1:8888
+```
+
+Use a local or private SearXNG instance if you want reliable bot-friendly search
+without falling back to Google.
 
 ---
 

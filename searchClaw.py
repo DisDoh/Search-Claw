@@ -3,6 +3,7 @@
 
 import argparse
 import json
+import os
 import re
 import sys
 import time
@@ -35,6 +36,28 @@ MAX_FINAL_TRIES = 3
 
 # Max history messages used in chat mode
 CHAT_HISTORY_LIMIT = 6
+DUCKDUCKGO_LITE_URL = "https://lite.duckduckgo.com/lite/"
+DUCKDUCKGO_HTML_URL = "https://html.duckduckgo.com/html/"
+SEARXNG_BASE_URL = os.environ.get("SEARXNG_BASE_URL", "").strip().rstrip("/")
+FIREFOX_USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64; rv:126.0) Gecko/20100101 Firefox/126.0"
+
+
+class SearchBackendBlockedError(RuntimeError):
+    pass
+
+
+def firefox_headers(*, referer: str = "", accept: str = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8") -> Dict[str, str]:
+    headers = {
+        "User-Agent": FIREFOX_USER_AGENT,
+        "Accept": accept,
+        "Accept-Encoding": "gzip, deflate",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+    }
+    if referer:
+        headers["Referer"] = referer
+    return headers
 
 
 SYSTEM_PROMPT = """You are an agent that can use exactly one tool: web_search.
@@ -125,14 +148,6 @@ def normalize_url_for_compare(u: str) -> str:
 
     qs = parse_qs(p.query, keep_blank_values=True)
 
-    if netloc.endswith("play.google.com") and path == "/store/apps/details":
-        app_id = (qs.get("id") or [""])[0]
-        kept = {}
-        if app_id:
-            kept["id"] = [app_id]
-        query = urlencode({k: v[0] for k, v in kept.items()}, doseq=False)
-        return urlunparse((scheme, netloc, path, "", query, fragment))
-
     kept_qs = {}
     for k, v in qs.items():
         kl = k.lower()
@@ -218,14 +233,15 @@ def sanitize_final_answer(text: str) -> str:
 
 
 # -------------------------
-# Enforce Sources: minimum one (final safety net)
+# Enforce Sources from search results (final safety net)
 # -------------------------
-def ensure_sources_min_one(final_text: str, tool_results: List[Dict[str, str]]) -> str:
+def _duckduckgo_lite_search_url(query: str) -> str:
+    return DUCKDUCKGO_LITE_URL + "?" + urlencode({"q": query or ""})
+
+
+def _source_urls_from_results(tool_results: List[Dict[str, str]]) -> List[str]:
     """
-    Ensure the final answer ends with:
-      Sources:
-      - <url>
-    and contains at least one URL. URLs are taken ONLY from tool_results.
+    Return source URLs from DuckDuckGo Lite results only.
     """
     urls: List[str] = []
     seen = set()
@@ -234,27 +250,37 @@ def ensure_sources_min_one(final_text: str, tool_results: List[Dict[str, str]]) 
         if u and u not in seen:
             seen.add(u)
             urls.append(u)
+    return urls
+
+
+def ensure_sources_from_results(
+    final_text: str,
+    tool_results: List[Dict[str, str]],
+    fallback_query: str = "",
+) -> str:
+    """
+    Replace any model-provided Sources section with URLs from DuckDuckGo Lite
+    results. This prevents hallucinated sources such as Google search URLs.
+    """
+    urls = _source_urls_from_results(tool_results)
 
     if not urls:
-        return (final_text or "").strip() + "\n"
+        answer = (final_text or "I don't have usable search results to answer reliably.").strip()
+        if re.search(r"(?im)^\s*Sources:\s*$", answer):
+            answer = re.split(r"(?im)^\s*Sources:\s*$", answer, maxsplit=1)[0].strip()
+        if fallback_query:
+            return answer + "\n\nSources:\n- " + _duckduckgo_lite_search_url(fallback_query) + "\n"
+        return answer + "\n"
 
     t = (final_text or "").strip()
     if not t:
-        return "I don't have usable search results to answer reliably.\n\nSources:\n- " + urls[0] + "\n"
+        t = "I don't have usable search results to answer reliably."
 
-    if re.search(r"(?im)^\s*Sources:\s*$", t) is None:
-        return t + "\n\nSources:\n- " + urls[0] + "\n"
-
-    parts = re.split(r"(?im)^\s*Sources:\s*$", t, maxsplit=1)
-    if len(parts) == 2:
-        after = parts[1]
-        if re.search(r"(?im)https?://\S+", after) is None:
-            return t.rstrip() + "\n- " + urls[0] + "\n"
-
-    return t + "\n"
+    answer = re.split(r"(?im)^\s*Sources:\s*$", t, maxsplit=1)[0].strip()
+    return answer + "\n\nSources:\n" + "\n".join(f"- {u}" for u in urls) + "\n"
 
 
-def has_sources_min_one(text: str) -> bool:
+def has_sources_from_results(text: str, tool_results: List[Dict[str, str]]) -> bool:
     if not text:
         return False
     t = text.strip()
@@ -264,7 +290,9 @@ def has_sources_min_one(text: str) -> bool:
         return False
 
     after = t[m.end():]
-    return re.search(r"(?im)https?://\S+", after) is not None
+    urls = re.findall(r"(?im)^\s*(?:[-*]\s*)?(https?://\S+)\s*$", after)
+    allowed = set(_source_urls_from_results(tool_results))
+    return bool(urls) and all(u.rstrip(").,;]}>\"'") in allowed for u in urls)
 
 
 # -------------------------
@@ -294,6 +322,24 @@ def _decode_duckduckgo_target(href: str, base_url: str) -> Optional[str]:
     return target
 
 
+def _is_google_result_url(url: str) -> bool:
+    try:
+        host = urlparse(url).netloc.lower()
+    except Exception:
+        return False
+    if host.startswith("www."):
+        host = host[4:]
+    google_domains = (
+        "google.com",
+        "google.ch",
+        "google.fr",
+        "google.de",
+        "google.co.uk",
+        "google.ca",
+    )
+    return any(host == domain or host.endswith("." + domain) for domain in google_domains)
+
+
 def _parse_duckduckgo_results(html: str, base_url: str, max_results: int) -> List[Dict[str, str]]:
     soup = BeautifulSoup(html, "html.parser")
     results: List[Dict[str, str]] = []
@@ -320,6 +366,8 @@ def _parse_duckduckgo_results(html: str, base_url: str, max_results: int) -> Lis
         target_url = _decode_duckduckgo_target(href, base_url)
         if not target_url or target_url in seen:
             continue
+        if _is_google_result_url(target_url):
+            continue
 
         snippet = title
         result_container = a.find_parent(class_=re.compile(r"result", re.I))
@@ -327,11 +375,84 @@ def _parse_duckduckgo_results(html: str, base_url: str, max_results: int) -> Lis
             snippet_el = result_container.select_one(".result__snippet, .result-snippet")
             if snippet_el:
                 snippet = snippet_el.get_text(" ", strip=True) or title
+        else:
+            # DuckDuckGo Lite puts the result snippet in a following table row.
+            row = a.find_parent("tr")
+            if row:
+                next_row = row.find_next_sibling("tr")
+                for _ in range(3):
+                    if not next_row:
+                        break
+                    snippet_el = next_row.select_one(".result-snippet")
+                    if snippet_el:
+                        snippet = snippet_el.get_text(" ", strip=True) or title
+                        break
+                    next_row = next_row.find_next_sibling("tr")
 
         seen.add(target_url)
         results.append({"title": title, "snippet": snippet, "url": target_url})
         if len(results) >= max_results:
             break
+
+    return results
+
+
+def _search_searxng(
+    query: str,
+    max_results: int,
+    timeout: int,
+    debug: bool = False,
+    verbose: bool = False,
+) -> List[Dict[str, str]]:
+    if not SEARXNG_BASE_URL:
+        return []
+
+    url = SEARXNG_BASE_URL + "/search"
+    headers = firefox_headers(accept="application/json,text/html;q=0.9,*/*;q=0.8")
+    params = {
+        "q": query,
+        "format": "json",
+        "categories": "general",
+    }
+
+    t0 = time.time()
+    resp = requests.get(url, params=params, headers=headers, timeout=timeout)
+    dt = time.time() - t0
+
+    if debug:
+        log(f"web_search searxng GET {resp.url} -> {resp.status_code} in {dt:.2f}s", enabled=True)
+
+    resp.raise_for_status()
+    data = resp.json()
+
+    results: List[Dict[str, str]] = []
+    seen: set[str] = set()
+    for item in data.get("results") or []:
+        if not isinstance(item, dict):
+            continue
+        target_url = str(item.get("url") or "").strip()
+        title = str(item.get("title") or "").strip()
+        snippet = str(item.get("content") or item.get("snippet") or title).strip()
+
+        if not target_url.startswith(("http://", "https://")):
+            continue
+        if not title:
+            title = target_url
+        if _is_google_result_url(target_url):
+            continue
+        if target_url in seen:
+            continue
+
+        seen.add(target_url)
+        results.append({"title": title, "snippet": snippet or title, "url": target_url})
+        if len(results) >= max_results:
+            break
+
+    if debug:
+        log(f"web_search searxng parsed results: {len(results)}", enabled=True)
+        if verbose:
+            for i, r in enumerate(results, 1):
+                log(f"searxng[{i}] title={r['title']!r} url={r['url']!r}", verbose=True, enabled=True)
 
     return results
 
@@ -343,57 +464,76 @@ def web_search(
     debug: bool = False,
     verbose: bool = False,
 ) -> List[Dict[str, str]]:
-    urls = [
-        "https://lite.duckduckgo.com/lite/",
-        "https://html.duckduckgo.com/html/",
-        "https://duckduckgo.com/html/",
+    headers = firefox_headers(referer="https://duckduckgo.com/")
+
+    session = requests.Session()
+    session.headers.update(headers)
+
+    attempts = [
+        ("lite-get", "GET", DUCKDUCKGO_LITE_URL, {"q": query}, None),
+        ("lite-post", "POST", DUCKDUCKGO_LITE_URL, None, {"q": query}),
+        ("html-get", "GET", DUCKDUCKGO_HTML_URL, {"q": query}, None),
+        ("html-post", "POST", DUCKDUCKGO_HTML_URL, None, {"q": query}),
     ]
-    headers = {
-        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0 Safari/537.36 SearchClaw/1.0",
-        "Accept-Language": "en-US,en;q=0.9",
-    }
 
-    last_error: Optional[Exception] = None
-    for url in urls:
+    results: List[Dict[str, str]] = []
+    statuses: List[int] = []
+    for attempt_no, (label, method, url, params, data) in enumerate(attempts, 1):
         t0 = time.time()
-        try:
-            resp = requests.get(url, params={"q": query}, headers=headers, timeout=timeout)
-            dt = time.time() - t0
+        resp = session.request(method, url, params=params, data=data, timeout=timeout)
+        dt = time.time() - t0
+        statuses.append(resp.status_code)
 
-            if debug:
-                log(f"web_search GET {resp.url} -> {resp.status_code} in {dt:.2f}s", enabled=True)
-                if verbose:
-                    log(f"web_search headers: {headers}", verbose=True, enabled=True)
+        if debug:
+            log(
+                f"web_search {label} {method} {resp.url} -> {resp.status_code} in {dt:.2f}s attempt={attempt_no}",
+                enabled=True,
+            )
+            if verbose:
+                title = ""
+                try:
+                    soup = BeautifulSoup(resp.text, "html.parser")
+                    title = soup.title.get_text(" ", strip=True) if soup.title else ""
+                except Exception:
+                    title = ""
+                log(f"web_search page title: {title!r}", verbose=True, enabled=True)
 
-            resp.raise_for_status()
-            results = _parse_duckduckgo_results(resp.text, url, max_results)
+        resp.raise_for_status()
+        results = _parse_duckduckgo_results(resp.text, url, max_results)
+        if results:
+            break
 
-            if debug:
-                log(f"web_search parsed results from {url}: {len(results)}", enabled=True)
-                if verbose:
-                    for i, r in enumerate(results, 1):
-                        log(f"result[{i}] title={r['title']!r} url={r['url']!r}", verbose=True, enabled=True)
+        if debug:
+            log(f"web_search {label} produced 0 parsed results; trying next DuckDuckGo endpoint", enabled=True)
+        time.sleep(0.6 * attempt_no)
 
-            if results:
-                return results
-        except Exception as exc:
-            last_error = exc
-            if debug:
-                log(f"web_search failed for {url}: {exc}", enabled=True)
+    if not results and statuses and all(status in (202, 429) for status in statuses):
+        if SEARXNG_BASE_URL:
+            try:
+                results = _search_searxng(query, max_results, timeout, debug=debug, verbose=verbose)
+                if results:
+                    return results
+            except Exception as e:
+                if debug:
+                    log(f"web_search searxng fallback failed: {e}", enabled=True)
+        raise SearchBackendBlockedError(
+            f"DuckDuckGo returned no parseable results and statuses={statuses}"
+        )
 
-    if last_error:
-        raise last_error
-    return []
+    if debug:
+        log(f"web_search parsed DuckDuckGo results: {len(results)}", enabled=True)
+        if verbose:
+            for i, r in enumerate(results, 1):
+                log(f"result[{i}] title={r['title']!r} url={r['url']!r}", verbose=True, enabled=True)
+
+    return results
 
 
 # -------------------------
 # Enrich results (fetch a couple pages)
 # -------------------------
 def _fetch_page_text(url: str, timeout: int = 20) -> str:
-    headers = {
-        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) SearchClaw/1.0",
-        "Accept-Language": "en-US,en;q=0.9",
-    }
+    headers = firefox_headers()
     resp = requests.get(url, headers=headers, timeout=timeout)
     resp.raise_for_status()
 
@@ -620,6 +760,7 @@ def get_final_answer_with_reask(
         "Rules:\n"
         "- The Sources section MUST include at least ONE URL.\n"
         "- Use ONLY URLs present in TOOL_RESULT.\n"
+        "- Never use Google URLs unless they are explicitly present in TOOL_RESULT.\n"
         "- Do NOT repeat the answer.\n"
     )
 
@@ -661,15 +802,16 @@ def get_final_answer_with_reask(
             temperature=0.0,
         )
         text = sanitize_final_answer(text)
+        text = ensure_sources_from_results(text, tool_results)
         last_text = text
 
-        if has_sources_min_one(text):
+        if has_sources_from_results(text, tool_results):
             return text
 
         if debug:
-            log("Phase2 output invalid (missing Sources or URL). Will re-ask.", enabled=True)
+            log("Phase2 output invalid (missing result Sources URL). Will re-ask.", enabled=True)
 
-    enforced = ensure_sources_min_one(last_text, tool_results)
+    enforced = ensure_sources_from_results(last_text, tool_results)
     return enforced
 
 
@@ -691,8 +833,25 @@ def run_search_agent(
     if debug:
         log(f"Phase1 tool_req parsed: {tool_req}", enabled=True)
 
-    results = web_search(query, max_results=5, debug=debug, verbose=verbose)
+    try:
+        results = web_search(query, max_results=5, debug=debug, verbose=verbose)
+    except SearchBackendBlockedError as e:
+        if debug:
+            log(f"web_search blocked: {e}", enabled=True)
+        return ensure_sources_from_results(
+            "DuckDuckGo is currently blocking or rate-limiting the search backend, so I can't read reliable search results right now.",
+            [],
+            fallback_query=query,
+        )
+
     results = enrich_results_with_page_text(results, max_pages=max_open_pages, debug=debug, verbose=verbose)
+
+    if not results:
+        return ensure_sources_from_results(
+            "I don't have usable search results to answer reliably.",
+            results,
+            fallback_query=query,
+        )
 
     tool_payload = {"query": query, "results": results}
     tool_json = json.dumps(tool_payload, ensure_ascii=False)
@@ -711,7 +870,7 @@ def run_search_agent(
     )
 
     final_text = sanitize_final_answer(final_text)
-    final_text = ensure_sources_min_one(final_text, results)
+    final_text = ensure_sources_from_results(final_text, results)
     return final_text
 
 
