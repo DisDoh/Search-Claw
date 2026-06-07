@@ -7,6 +7,7 @@ import os
 import re
 import sys
 import time
+import traceback
 from datetime import datetime
 from typing import List, Dict, Any, Tuple, Optional
 from urllib.parse import urljoin, urlparse, parse_qs, unquote, urlencode, urlunparse
@@ -128,6 +129,18 @@ def log(msg: str, *, verbose: bool = False, enabled: bool = True) -> None:
         return
     prefix = "[verbose]" if verbose else "[debug]"
     print(f"{prefix} {_ts()} {msg}", file=sys.stderr)
+
+
+def log_exception(label: str, exc: BaseException) -> None:
+    print(f"[error] {_ts()} {label}: {exc}", file=sys.stderr)
+    print(traceback.format_exc(), file=sys.stderr)
+
+
+def user_facing_error_reply(mode: str) -> str:
+    mode = (mode or "").strip().lower()
+    if mode == "chat":
+        return "I hit an internal error while generating that reply. Please try again.\n"
+    return "I hit an internal error while processing that search. Please try again.\n"
 
 
 # -------------------------
@@ -1033,9 +1046,11 @@ def serve_http(host: str = "127.0.0.1", port: int = 8811, debug: bool = False, v
                     reply = reply[:3500] + "\n\n[truncated]"
                 self._send(200, {"reply": reply, "mode": mode})
             except requests.RequestException as e:
+                log_exception(f"HTTP /message network_error mode={mode} text={text[:200]!r}", e)
                 self._send(502, {"error": "network_error", "detail": str(e)})
             except Exception as e:
-                self._send(500, {"error": "agent_error", "detail": str(e)})
+                log_exception(f"HTTP /message agent_error mode={mode} text={text[:200]!r}", e)
+                self._send(200, {"reply": user_facing_error_reply(mode), "mode": mode, "error": "agent_error"})
 
         def log_message(self, fmt: str, *args: Any) -> None:
             print(f"[http] {_ts()} {self.address_string()} - {fmt % args}", file=sys.stderr)
