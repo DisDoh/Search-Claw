@@ -37,6 +37,7 @@ const IGNORE_HISTORY_TEXTS = new Set([
   "working on it",
   "searching the web...",
   "searching the web",
+  "agent error. check bridge logs.",
 ]);
 
 function normalizeHistoryText(s) {
@@ -49,6 +50,18 @@ function normalizeHistoryText(s) {
 function shouldIgnoreHistoryMessage(body) {
   const normalized = normalizeHistoryText(body);
   return IGNORE_HISTORY_TEXTS.has(normalized);
+}
+
+function shouldIncludeHistoryMessage(message) {
+  if (!message || typeof message.body !== "string") return false;
+
+  const body = message.body.trim();
+  if (!body) return false;
+  if (message.type && message.type !== "chat") return false;
+  if (shouldIgnoreHistoryMessage(body)) return false;
+  if (parsePrefixedCommand(body)) return false;
+
+  return true;
 }
 
 // Dedup to avoid double replies (message + message_create)
@@ -122,44 +135,47 @@ function ackMessageForMode(mode) {
   return "Working on it...";
 }
 
-async function getRecentChatHistory(msg, limit = 3) {
+async function getRecentChatHistory(replyChatId, limit = 3) {
   try {
-    const chat = await msg.getChat();
+    const chat = await client.getChatById(replyChatId);
     if (!chat) return [];
+    const rawMessages = await client.pupPage.evaluate(
+      async (chatId, fetchLimit) => {
+        const chat = await window.WWebJS.getChat(chatId, { getAsModel: false });
+        if (!chat || !chat.msgs || typeof chat.msgs.getModelsArray !== "function") {
+          return [];
+        }
 
-    // Fetch a few extra messages in case some are empty/system messages
-    const fetched = await chat.fetchMessages({ limit: Math.max(limit + 6, 10) });
+        const msgs = chat.msgs.getModelsArray();
+        if (!Array.isArray(msgs) || msgs.length === 0) {
+          return [];
+        }
 
-    if (!Array.isArray(fetched) || fetched.length === 0) return [];
+        const sorted = msgs
+          .filter(m => m && !m.isNotification)
+          .sort((a, b) => (a.t || 0) - (b.t || 0));
 
-    // Oldest -> newest
-    const sorted = fetched
-      .filter(m => m && typeof m.body === "string")
+        return sorted.slice(-fetchLimit).map(m => window.WWebJS.getMessageModel(m));
+      },
+      replyChatId,
+      Math.max(limit + 8, 12)
+    );
+
+    if (!Array.isArray(rawMessages) || rawMessages.length === 0) return [];
+
+    const history = rawMessages
+      .filter(shouldIncludeHistoryMessage)
       .sort((a, b) => {
         const ta = a.timestamp || 0;
         const tb = b.timestamp || 0;
         return ta - tb;
-      });
-
-    const history = [];
-    for (const m of sorted) {
-      const body = (m.body || "").trim();
-      if (!body) continue;
-
-      // Keep only normal chat text
-      if (m.type && m.type !== "chat") continue;
-
-      // Ignore bridge acknowledgement messages like
-      // "Working on it..." and "Searching the web..."
-      if (shouldIgnoreHistoryMessage(body)) continue;
-
-      history.push({
+      })
+      .map(m => ({
         role: m.fromMe ? "assistant" : "user",
-        text: body,
+        text: m.body.trim(),
         timestamp: m.timestamp || null,
         id: m.id && m.id._serialized ? m.id._serialized : null,
-      });
-    }
+      }));
 
     // Keep last N messages from this discussion
     return history.slice(-limit);
@@ -220,16 +236,7 @@ async function handleMessage(msg, tag) {
 
     let history = [];
     if (mode === "chat") {
-      history = await getRecentChatHistory(msg, CHAT_HISTORY_LIMIT);
-
-      // Optional: remove the current prefixed command from history if it is already there
-      // and replace it with the cleaned text version
-      if (history.length > 0) {
-        const last = history[history.length - 1];
-        if (last && typeof last.text === "string" && last.text.trim() === raw) {
-          last.text = text;
-        }
-      }
+      history = await getRecentChatHistory(replyChatId, CHAT_HISTORY_LIMIT);
     }
 
     const payload = {

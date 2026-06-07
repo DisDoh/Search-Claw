@@ -102,6 +102,19 @@ IMPORTANT:
 * In PHASE 1 you MUST output valid JSON. No commentary. No extra words.
   """
 
+CHAT_SYSTEM_PROMPT = """You are Search Claw in chat mode.
+
+You are having a normal conversation with the user.
+
+Rules:
+- Reply directly to the user's message.
+- Use the supplied chat history for context when it is relevant.
+- Do not invent tool usage, search results, citations, or sources.
+- If the user asks for current or externally verified information, say that chat mode cannot verify it and ask them to use search mode with `?`.
+- Keep the answer clear and concise unless the user asks for more detail.
+- Match the language of the user's message.
+"""
+
 
 # -------------------------
 # Logging helpers

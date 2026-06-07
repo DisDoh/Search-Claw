@@ -16,95 +16,6 @@ The default setup uses:
 
 ---
 
-## Minimal one-time launcher: `./run_all.sh`
-
-The easiest way to start Search Claw on Linux/macOS is the simplified launcher. It now handles the full local stack:
-
-- creates and uses the Python virtual environment in `.venv/`
-- installs Python requirements
-- checks for `llama.cpp` in your home folder, for example `~/llama.cpp`
-- if `llama.cpp` is missing, clones it into your home folder
-- compiles `llama.cpp` in CPU mode or CUDA mode
-- starts the `llama-server`
-- starts the Search Claw Python server
-- starts Discord, WhatsApp, or both
-
-Run it from the project root:
-
-```bash
-chmod +x run_all.sh
-./run_all.sh
-```
-
-On the first run, it asks only the minimum needed. Every prompt shows a default value in brackets; pressing Enter with an empty answer keeps that proposed default.
-
-- `1` = launch Discord only
-- `2` = launch WhatsApp only
-- `3` = launch both
-- where to install/find `llama.cpp`, default: `~/llama.cpp`
-- your `.gguf` model path, for example `~/models/ColdBrew-Lucid.Q4_K_M.gguf`
-- whether to compile `llama.cpp` with CUDA
-- Discord bot token, only if Discord is selected
-- Discord Application ID / Client ID, only if Discord is selected
-
-The Discord token prompt is visible on purpose, because some terminals block paste or look frozen when hidden input is used. Paste/type the token normally and press Enter. If your terminal still refuses paste or typing, let the launcher create `discord/.env`, stop it with `Ctrl+C`, then edit this line manually:
-
-```env
-DISCORD_TOKEN=your_real_token_here
-```
-
-Then run `./run_all.sh` again and press Enter to reuse the saved config.
-
-Important: keep `discord/.env` as pure `KEY=value` lines. Do not add raw notes like `Discord token here` without a `#` at the beginning. The launcher now safely ignores accidental text lines instead of trying to execute them, but a clean file should look like this:
-
-```env
-DISCORD_TOKEN=your_real_token_here
-DISCORD_CLIENT_ID=your_application_id_here
-```
-
-The launcher automatically creates these files/folders when needed:
-
-```text
-.env
-discord/.env
-.run_all.env
-.venv/
-~/llama.cpp/     # unless you choose another install folder
-```
-
-The default local config is:
-
-```text
-LLAMA_BASE_URL=http://127.0.0.1:8033
-LLAMA_CPP_DIR=$HOME/llama.cpp
-MODEL_PATH=$HOME/models/model.gguf
-LLAMA_CTX=4096
-LLAMA_NGL=0          # CPU mode
-LLAMA_NGL=999        # CUDA mode
-SEARCH_CLAW_PORT=8811
-MAX_OPEN_PAGES=5
-CHAT_HISTORY_LIMIT=6
-CHAT_PREFIX=!
-SEARCH_PREFIX=?
-```
-
-If you choose CUDA, make sure your NVIDIA driver and CUDA toolkit are already installed. If the CUDA build fails, run the launcher again, choose not to reuse the saved config, then answer `n` for CUDA to build CPU mode.
-
-If `llama-server` fails at startup, the launcher no longer closes immediately. It keeps the terminal open, shows the last error lines, and saves logs in:
-
-```text
-logs/llama.cpp_LLM_server.log
-logs/Search_Claw_Python_server.log
-logs/Discord_bridge.log
-logs/WhatsApp_bridge.log
-```
-
-Common `llama.cpp` startup errors are a wrong `.gguf` model path, a model that needs more RAM/VRAM, CUDA build problems, or port `8033` already being used.
-
-The Python server runs inside `.venv`. When you press `Ctrl+C`, the launcher stops the llama.cpp server, Search Claw, Discord/WhatsApp, and deactivates the virtual environment.
-
-On later runs, it asks whether to reuse the saved launcher config. Press Enter for yes. Choose `n` only when you want to change Discord/WhatsApp mode, model path, llama.cpp location, or CUDA/CPU mode. When reconfiguring, pressing Enter on any individual prompt keeps the already proposed value.
-
 ## Features
 
 - Command-line search assistant
@@ -594,6 +505,95 @@ IGNORE_GROUPS=true
 ```
 
 ---
+
+## Minimal one-time launcher: `./run_all.sh`
+
+The easiest way to start Search Claw on Linux/macOS is the simplified launcher. It now handles the full local stack:
+
+- creates and uses the Python virtual environment in `.venv/`
+- installs Python requirements
+- checks for `llama.cpp` in your home folder, for example `~/llama.cpp`
+- if `llama.cpp` is missing, clones it into your home folder
+- compiles `llama.cpp` in CPU mode or CUDA mode
+- starts the `llama-server`
+- starts the Search Claw Python server
+- starts Discord, WhatsApp, or both
+
+Run it from the project root:
+
+```bash
+chmod +x run_all.sh
+./run_all.sh
+```
+
+On the first run, it asks only the minimum needed. Every prompt shows a default value in brackets; pressing Enter with an empty answer keeps that proposed default.
+
+- `1` = launch Discord only
+- `2` = launch WhatsApp only
+- `3` = launch both
+- where to install/find `llama.cpp`, default: `~/llama.cpp`
+- your `.gguf` model path, for example `~/models/ColdBrew-Lucid.Q4_K_M.gguf`
+- whether to compile `llama.cpp` with CUDA
+- Discord bot token, only if Discord is selected
+- Discord Application ID / Client ID, only if Discord is selected
+
+The Discord token prompt is visible on purpose, because some terminals block paste or look frozen when hidden input is used. Paste/type the token normally and press Enter. If your terminal still refuses paste or typing, let the launcher create `discord/.env`, stop it with `Ctrl+C`, then edit this line manually:
+
+```env
+DISCORD_TOKEN=your_real_token_here
+```
+
+Then run `./run_all.sh` again and press Enter to reuse the saved config.
+
+Important: keep `discord/.env` as pure `KEY=value` lines. Do not add raw notes like `Discord token here` without a `#` at the beginning. The launcher now safely ignores accidental text lines instead of trying to execute them, but a clean file should look like this:
+
+```env
+DISCORD_TOKEN=your_real_token_here
+DISCORD_CLIENT_ID=your_application_id_here
+```
+
+The launcher automatically creates these files/folders when needed:
+
+```text
+.env
+discord/.env
+.run_all.env
+.venv/
+~/llama.cpp/     # unless you choose another install folder
+```
+
+The default local config is:
+
+```text
+LLAMA_BASE_URL=http://127.0.0.1:8033
+LLAMA_CPP_DIR=$HOME/llama.cpp
+MODEL_PATH=$HOME/models/model.gguf
+LLAMA_CTX=4096
+LLAMA_NGL=0          # CPU mode
+LLAMA_NGL=999        # CUDA mode
+SEARCH_CLAW_PORT=8811
+MAX_OPEN_PAGES=5
+CHAT_HISTORY_LIMIT=6
+CHAT_PREFIX=!
+SEARCH_PREFIX=?
+```
+
+If you choose CUDA, make sure your NVIDIA driver and CUDA toolkit are already installed. If the CUDA build fails, run the launcher again, choose not to reuse the saved config, then answer `n` for CUDA to build CPU mode.
+
+If `llama-server` fails at startup, the launcher no longer closes immediately. It keeps the terminal open, shows the last error lines, and saves logs in:
+
+```text
+logs/llama.cpp_LLM_server.log
+logs/Search_Claw_Python_server.log
+logs/Discord_bridge.log
+logs/WhatsApp_bridge.log
+```
+
+Common `llama.cpp` startup errors are a wrong `.gguf` model path, a model that needs more RAM/VRAM, CUDA build problems, or port `8033` already being used.
+
+The Python server runs inside `.venv`. When you press `Ctrl+C`, the launcher stops the llama.cpp server, Search Claw, Discord/WhatsApp, and deactivates the virtual environment.
+
+On later runs, it asks whether to reuse the saved launcher config. Press Enter for yes. Choose `n` only when you want to change Discord/WhatsApp mode, model path, llama.cpp location, or CUDA/CPU mode. When reconfiguring, pressing Enter on any individual prompt keeps the already proposed value.
 
 ## Troubleshooting
 
