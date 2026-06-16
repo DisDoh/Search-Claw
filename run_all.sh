@@ -19,10 +19,16 @@ fail() { printf '\033[1;31m%s\033[0m\n' "$*" >&2; exit 1; }
 
 pause_on_error() {
   local code="${1:-0}"
-  if [[ "$code" != "0" && -t 0 ]]; then
+  if [[ "$code" != "0" && "$code" != "130" && "$code" != "143" ]]; then
     printf '\n'
     warn "The launcher stopped because of an error. The terminal will stay open so you can read it."
-    read -r -p "Press Enter to close..." _ || true
+    if [[ -r /dev/tty ]]; then
+      read -r -p "Press Enter to close..." _ < /dev/tty || true
+    elif [[ -t 0 ]]; then
+      read -r -p "Press Enter to close..." _ || true
+    else
+      warn "No interactive terminal was available for the pause prompt."
+    fi
   fi
 }
 
@@ -50,9 +56,9 @@ ask() {
 
 ask_discord_token() {
   local default="${1:-}" value
-  echo ""
-  echo "Discord token input: paste or type the token normally, then press Enter."
-  echo "Tip: if your terminal blocks paste, open discord/.env after this script creates it and edit DISCORD_TOKEN there."
+  echo "" >&2
+  echo "Discord token input: paste or type the token normally, then press Enter." >&2
+  echo "Tip: if your terminal blocks paste, open discord/.env after this script creates it and edit DISCORD_TOKEN there." >&2
   read -r -p "Discord bot token [$default]: " value || true
   printf '%s' "${value:-$default}"
 }
@@ -156,14 +162,22 @@ ENV
 
 fix_discord_token_prefix() {
   [[ -f "$DISCORD_ENV_FILE" ]] || return 0
-  grep -qE '^DISCORD_TOKEN=' "$DISCORD_ENV_FILE" && return 0
 
   local tmp="$DISCORD_ENV_FILE.tmp" fixed="false" line
   : > "$tmp"
   while IFS= read -r line || [[ -n "$line" ]]; do
-    if [[ "$fixed" == "false" && -n "$line" && ! "$line" =~ ^[[:space:]]*# && ! "$line" == *=* && ! "$line" =~ [[:space:]] ]]; then
+    if [[ "$line" =~ ^DISCORD_TOKEN= ]]; then
+      if [[ "$fixed" == "false" && -n "${line#DISCORD_TOKEN=}" ]]; then
+        printf '%s\n' "$line" >> "$tmp"
+        fixed="true"
+      elif [[ "$fixed" == "true" ]]; then
+        printf '%s\n' "$line" >> "$tmp"
+      fi
+    elif [[ "$fixed" == "false" && -n "$line" && ! "$line" =~ ^[[:space:]]*# && ! "$line" == *=* && ! "$line" =~ [[:space:]] ]]; then
       printf 'DISCORD_TOKEN=%s\n' "$line" >> "$tmp"
       fixed="true"
+    elif [[ "$fixed" == "false" && "$line" =~ ^(Discord token input:|Tip:|Discord bot token ) ]]; then
+      continue
     else
       printf '%s\n' "$line" >> "$tmp"
     fi
@@ -279,6 +293,87 @@ setup_llama_cpp() {
   [[ -f "${MODEL_PATH:-}" ]] || fail "GGUF model not found: ${MODEL_PATH:-empty}. Edit MODEL_PATH in .env or run this script again and enter the correct path."
 }
 
+pid_command() {
+  ps -p "$1" -o command= 2>/dev/null || true
+}
+
+stop_stale_pid() {
+  local pid="$1" reason="$2" pgid
+  [[ -n "$pid" && "$pid" != "$$" ]] || return 0
+  kill -0 "$pid" >/dev/null 2>&1 || return 0
+
+  warn "Stopping old Search Claw process $pid ($reason)"
+  pgid="$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ' || true)"
+  if [[ -n "$pgid" && "$pgid" != "$$" && "$pgid" != "$(ps -o pgid= -p "$$" | tr -d ' ')" ]]; then
+    kill -TERM -- "-$pgid" >/dev/null 2>&1 || true
+  else
+    kill -TERM "$pid" >/dev/null 2>&1 || true
+  fi
+
+  local i
+  for i in {1..20}; do
+    kill -0 "$pid" >/dev/null 2>&1 || return 0
+    sleep 0.2
+  done
+
+  if [[ -n "$pgid" && "$pgid" != "$$" && "$pgid" != "$(ps -o pgid= -p "$$" | tr -d ' ')" ]]; then
+    kill -KILL -- "-$pgid" >/dev/null 2>&1 || true
+  else
+    kill -KILL "$pid" >/dev/null 2>&1 || true
+  fi
+}
+
+stop_matching_pids() {
+  local pattern="$1" reason="$2" pid
+  while IFS= read -r pid; do
+    [[ -n "$pid" ]] || continue
+    stop_stale_pid "$pid" "$reason"
+  done < <(pgrep -f "$pattern" 2>/dev/null || true)
+}
+
+port_pids() {
+  local port="$1"
+  lsof -tiTCP:"$port" -sTCP:LISTEN 2>/dev/null || true
+}
+
+ensure_port_available() {
+  local port="$1" service="$2" pid cmd
+  while IFS= read -r pid; do
+    [[ -n "$pid" ]] || continue
+    cmd="$(pid_command "$pid")"
+    case "$service" in
+      llama)
+        if [[ "$cmd" == *"llama-server"* && ( "$cmd" == *"--port ${LLAMA_PORT:-8033}"* || "$cmd" == *"${MODEL_PATH:-}"* ) ]]; then
+          stop_stale_pid "$pid" "old llama.cpp server on port $port"
+        else
+          fail "Port $port is already in use by PID $pid: $cmd"
+        fi
+        ;;
+      search)
+        if [[ "$cmd" == *"$ROOT_DIR/searchClaw.py"* || "$cmd" == *"searchClaw.py --server"* ]]; then
+          stop_stale_pid "$pid" "old Search Claw Python server on port $port"
+        else
+          fail "Port $port is already in use by PID $pid: $cmd"
+        fi
+        ;;
+      *)
+        fail "Internal launcher error: unknown service '$service'."
+        ;;
+    esac
+  done < <(port_pids "$port")
+}
+
+cleanup_stale_search_claw_processes() {
+  say "Checking for old Search Claw processes"
+  command -v lsof >/dev/null 2>&1 || fail "lsof not found. Install lsof so the launcher can check occupied ports."
+  command -v pgrep >/dev/null 2>&1 || fail "pgrep not found. Install procps so the launcher can find old bridge/browser processes."
+  ensure_port_available "${LLAMA_PORT:-8033}" "llama"
+  ensure_port_available "${SEARCH_CLAW_PORT:-8811}" "search"
+  stop_matching_pids "$ROOT_DIR/discord/bridge\\.js" "old Discord bridge"
+  stop_matching_pids "$ROOT_DIR/whatsapp/bridge\\.js" "old WhatsApp bridge"
+  stop_matching_pids "$ROOT_DIR/whatsapp/\\.wwebjs_auth/session-searchclaw-whatsapp" "old WhatsApp browser session"
+}
+
 safe_log_name() {
   printf '%s' "$1" | tr ' /' '__' | tr -cd 'A-Za-z0-9_.-'
 }
@@ -295,14 +390,14 @@ start_process() {
       setsid bash -lc "$cmd" >> "$log_file" 2>&1 &
     else
       # Visible mode keeps QR codes and bridge output in the terminal, while also saving logs.
-      setsid bash -c 'bash -lc "$1" 2>&1 | tee -a "$2"' _ "$cmd" "$log_file" &
+      setsid bash -c 'set -o pipefail; bash -lc "$1" 2>&1 | tee -a "$2"' _ "$cmd" "$log_file" &
     fi
   elif [[ "$mode" == "log_only" ]]; then
     : > "$log_file"
     bash -lc "$cmd" >> "$log_file" 2>&1 &
   else
     # Visible mode keeps QR codes and bridge output in the terminal, while also saving logs.
-    bash -lc "$cmd" 2>&1 | tee -a "$log_file" &
+    (set -o pipefail; bash -lc "$cmd" 2>&1 | tee -a "$log_file") &
   fi
   local pid=$!
   PIDS+=("$pid")
@@ -335,6 +430,39 @@ check_process_alive() {
   fi
 }
 
+wait_for_llama_ready() {
+  local base_url="http://${LLAMA_HOST:-127.0.0.1}:${LLAMA_PORT:-8033}"
+  local timeout="${LLAMA_READY_TIMEOUT:-300}"
+  local waited=0
+  command -v curl >/dev/null 2>&1 || fail "curl not found. Install curl so the launcher can wait for llama.cpp readiness."
+  say "Waiting for llama.cpp to finish loading"
+
+  while (( waited < timeout )); do
+    check_process_alive 0
+
+    if curl --fail --silent --max-time 2 "$base_url/health" >/dev/null 2>&1; then
+      echo "llama.cpp is ready at $base_url"
+      return 0
+    fi
+    if curl --fail --silent --max-time 2 "$base_url/v1/models" >/dev/null 2>&1; then
+      echo "llama.cpp is ready at $base_url"
+      return 0
+    fi
+
+    sleep 2
+    waited=$((waited + 2))
+    if (( waited % 20 == 0 )); then
+      echo "Still waiting for llama.cpp... ${waited}s/${timeout}s"
+    fi
+  done
+
+  warn "llama.cpp did not become ready within ${timeout}s. Showing the last log lines:"
+  echo "----- ${PID_LOGS[0]} -----"
+  tail -n 120 "${PID_LOGS[0]}" 2>/dev/null || true
+  echo "----------------"
+  fail "llama.cpp is running but not ready. Try increasing LLAMA_READY_TIMEOUT in .env if your model loads slowly."
+}
+
 monitor_processes() {
   while true; do
     sleep 2
@@ -351,6 +479,13 @@ monitor_processes() {
         fail "$name stopped unexpectedly."
       fi
     done
+  done
+}
+
+check_all_processes_alive() {
+  local i
+  for i in "${!PIDS[@]}"; do
+    check_process_alive "$i"
   done
 }
 
@@ -377,9 +512,12 @@ cleanup() {
   wait >/dev/null 2>&1 || true
   if declare -F deactivate >/dev/null 2>&1; then deactivate || true; fi
   warn "Closed. Python virtual environment deactivated."
+  pause_on_error "$code"
   exit "$code"
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 cd "$ROOT_DIR"
 
@@ -393,9 +531,11 @@ else
 fi
 
 setup_python
+fix_discord_token_prefix
 load_env "$ENV_FILE"
 load_env "$RUN_ENV_FILE"
 setup_llama_cpp
+cleanup_stale_search_claw_processes
 
 case "${LAUNCH_MODE:-both}" in
   discord)
@@ -422,10 +562,9 @@ case "${LAUNCH_MODE:-both}" in
 esac
 
 start_process "llama.cpp LLM server" "'$LLAMA_CPP_DIR/build/bin/llama-server' -m '$MODEL_PATH' -c '${LLAMA_CTX:-4096}' -ngl '${LLAMA_NGL:-0}' --host '${LLAMA_HOST:-127.0.0.1}' --port '${LLAMA_PORT:-8033}'" "log_only"
-sleep 4
-check_process_alive 0
+wait_for_llama_ready
 
-start_process "Search Claw Python server" "cd '$ROOT_DIR' && source '$VENV_DIR/bin/activate' && set -a && source '$ENV_FILE' && set +a && python searchClaw.py --server; deactivate || true"
+start_process "Search Claw Python server" "cd '$ROOT_DIR' && source '$VENV_DIR/bin/activate' && set -a && source '$ENV_FILE' && set +a && python searchClaw.py --server --host '${SEARCH_CLAW_HOST:-127.0.0.1}' --port '${SEARCH_CLAW_PORT:-8811}'; deactivate || true"
 
 case "${LAUNCH_MODE:-both}" in
   discord)
@@ -439,6 +578,9 @@ case "${LAUNCH_MODE:-both}" in
     start_process "WhatsApp bridge" "cd '$ROOT_DIR/whatsapp' && set -a && source '$ENV_FILE' && set +a && node bridge.js"
     ;;
 esac
+
+sleep 3
+check_all_processes_alive
 
 say "Running. Press Ctrl+C to stop everything."
 monitor_processes

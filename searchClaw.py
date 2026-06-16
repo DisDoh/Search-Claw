@@ -24,6 +24,8 @@ LLAMA_CHAT_ENDPOINT = f"{LLAMA_BASE_URL}/v1/chat/completions"
 
 LLAMA_CONNECT_TIMEOUT = 10
 LLAMA_READ_TIMEOUT = 600
+LLAMA_BUSY_RETRIES = 8
+LLAMA_BUSY_SLEEP = 3
 
 # If your llama.cpp server exposes /v1/models, you can set this to that id.
 # Some servers REQUIRE "model" in payload even if ignored.
@@ -670,13 +672,25 @@ def llm_chat(
         if verbose:
             log(f"llm_chat payload:\n{json.dumps(payload, ensure_ascii=False, indent=2)}", verbose=True, enabled=True)
 
-    t0 = time.time()
-    resp = requests.post(
-        LLAMA_CHAT_ENDPOINT,
-        json=payload,
-        timeout=(LLAMA_CONNECT_TIMEOUT, LLAMA_READ_TIMEOUT),
-    )
-    dt = time.time() - t0
+    resp = None
+    dt = 0.0
+    for attempt in range(LLAMA_BUSY_RETRIES + 1):
+        t0 = time.time()
+        resp = requests.post(
+            LLAMA_CHAT_ENDPOINT,
+            json=payload,
+            timeout=(LLAMA_CONNECT_TIMEOUT, LLAMA_READ_TIMEOUT),
+        )
+        dt = time.time() - t0
+        if resp.status_code != 503 or attempt == LLAMA_BUSY_RETRIES:
+            break
+        if debug:
+            log(
+                f"llm_chat got 503 from llama.cpp; retrying in {LLAMA_BUSY_SLEEP}s "
+                f"({attempt + 1}/{LLAMA_BUSY_RETRIES})",
+                enabled=True,
+            )
+        time.sleep(LLAMA_BUSY_SLEEP)
 
     if debug:
         log(f"llm_chat status={resp.status_code} in {dt:.2f}s", enabled=True)
