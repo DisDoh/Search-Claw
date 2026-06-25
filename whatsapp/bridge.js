@@ -30,6 +30,12 @@ const CHAT_HISTORY_LIMIT = 6;
 // Search agent: maximum number of pages the Python agent may open
 const MAX_OPEN_PAGES = 5;
 
+// WhatsApp Web can reload itself while whatsapp-web.js is injecting its
+// helpers. Puppeteer then rejects with "Execution context was destroyed".
+// Treat that navigation race as transient instead of crashing the launcher.
+const INITIALIZE_MAX_ATTEMPTS = 5;
+const INITIALIZE_RETRY_DELAY_MS = 2000;
+
 // Do not include temporary acknowledgement messages in the LLM memory.
 // These are messages sent by this bridge before the real answer arrives.
 const IGNORE_HISTORY_TEXTS = new Set([
@@ -306,4 +312,60 @@ client.on("disconnected", (reason) => console.error("❌ Disconnected:", reason)
 client.on("message", (msg) => handleMessage(msg, "[message]"));
 client.on("message_create", (msg) => handleMessage(msg, "[message_create]"));
 
-client.initialize();
+function isTransientInitializationError(error) {
+  const message = String(error?.message || error || "").toLowerCase();
+  return [
+    "execution context was destroyed",
+    "cannot find context with specified id",
+    "most likely because of a navigation",
+    "inspected target navigated or closed",
+    "target closed",
+    "session closed",
+  ].some(fragment => message.includes(fragment));
+}
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function closeBrowserAfterFailedInitialization() {
+  try {
+    if (client.pupBrowser) await client.destroy();
+  } catch (error) {
+    console.warn(
+      "WhatsApp browser cleanup warning:",
+      error?.message || String(error)
+    );
+  } finally {
+    client.pupBrowser = null;
+    client.pupPage = null;
+  }
+}
+
+async function initializeClient() {
+  for (let attempt = 1; attempt <= INITIALIZE_MAX_ATTEMPTS; attempt += 1) {
+    try {
+      await client.initialize();
+      return;
+    } catch (error) {
+      const transient = isTransientInitializationError(error);
+      console.error(
+        `WhatsApp initialization failed (attempt ${attempt}/${INITIALIZE_MAX_ATTEMPTS}):`,
+        error?.message || String(error)
+      );
+
+      if (!transient || attempt === INITIALIZE_MAX_ATTEMPTS) {
+        await closeBrowserAfterFailedInitialization();
+        process.exitCode = 1;
+        return;
+      }
+
+      await closeBrowserAfterFailedInitialization();
+      const delay = INITIALIZE_RETRY_DELAY_MS * attempt;
+      console.warn(`WhatsApp Web navigated during startup; retrying in ${delay}ms...`);
+      await sleep(delay);
+    }
+  }
+}
+
+initializeClient();

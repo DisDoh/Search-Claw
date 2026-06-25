@@ -32,7 +32,10 @@ LLAMA_BUSY_SLEEP = 3
 LLAMA_MODEL = ""  # optional
 LLAMA_TEMPERATURE = 0.7
 LLAMA_TOP_P = 0.9
-LLAMA_MAX_TOKENS = 300  # phase 1 doesn't need much
+LLAMA_MAX_TOKENS = int(os.environ.get("LLAMA_MAX_TOKENS", "900"))
+LLAMA_FINAL_MAX_TOKENS = int(
+    os.environ.get("LLAMA_FINAL_MAX_TOKENS", str(max(LLAMA_MAX_TOKENS, 1200)))
+)
 
 # Phase 2: how many times to re-ask if format is wrong
 MAX_FINAL_TRIES = 3
@@ -220,6 +223,24 @@ def collapse_duplicate_answer(text: str) -> str:
             if a and b and norm(a) == norm(b):
                 return a + "\n"
     return text
+
+
+def looks_like_internal_reasoning(text: str) -> bool:
+    """Detect common scratchpad/research-summary shapes before they reach users."""
+    t = (text or "").strip().lower()
+    if not t:
+        return False
+
+    signals = (
+        "user question:",
+        "tool result provided",
+        "implied meaning:",
+        "implied nvidia",
+        "let me re-read",
+        "my internal thought process",
+        "previous (invalid) answer:",
+    )
+    return sum(signal in t for signal in signals) >= 2
 
 
 def sanitize_final_answer(text: str) -> str:
@@ -708,7 +729,17 @@ def llm_chat(
     msg = choice0.get("message") or {}
     content = (msg.get("content") or "").strip()
     reasoning = (msg.get("reasoning_content") or "").strip()
-    text = content if content else reasoning
+
+    # reasoning_content is the model's private scratchpad, not a user-facing
+    # fallback. Some reasoning models exhaust max_tokens before producing
+    # content; returning the scratchpad here leaks chain-of-thought.
+    text = content
+    if not text and reasoning and debug:
+        log(
+            "llm_chat received reasoning_content but no final content; "
+            "discarding private reasoning",
+            enabled=True,
+        )
 
     text = collapse_duplicate_answer(text).strip()
     if text:
@@ -837,9 +868,19 @@ def get_final_answer_with_reask(
             response_format=None,
             debug=debug,
             verbose=verbose,
-            max_tokens=500,
+            max_tokens=LLAMA_FINAL_MAX_TOKENS,
             temperature=0.0,
         )
+
+        if not text.strip() or looks_like_internal_reasoning(text):
+            last_text = ""
+            if debug:
+                log(
+                    "Phase2 output empty or resembled internal reasoning. Will re-ask.",
+                    enabled=True,
+                )
+            continue
+
         text = sanitize_final_answer(text)
         text = ensure_sources_from_results(text, tool_results)
         last_text = text
@@ -995,13 +1036,18 @@ def serve_http(host: str = "127.0.0.1", port: int = 8811, debug: bool = False, v
     class Handler(BaseHTTPRequestHandler):
         server_version = "SearchClawHTTP/1.2"
 
-        def _send(self, code: int, payload: Dict[str, Any]) -> None:
+        def _send(self, code: int, payload: Dict[str, Any]) -> bool:
             body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-            self.send_response(code)
-            self.send_header("Content-Type", "application/json; charset=utf-8")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+            try:
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return True
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError) as e:
+                log(f"HTTP client disconnected before response could be sent: {e}", enabled=True)
+                return False
 
         def do_POST(self) -> None:
             if self.path.rstrip("/") != "/message":

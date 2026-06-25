@@ -12,6 +12,8 @@ PID_NAMES=()
 PID_LOGS=()
 LOG_DIR="$ROOT_DIR/logs"
 CLEANING_UP=false
+LLAMA_BUILD_DIR=""
+LLAMA_SERVER_BIN=""
 
 say() { printf '\n\033[1;36m%s\033[0m\n' "$*"; }
 warn() { printf '\033[1;33m%s\033[0m\n' "$*"; }
@@ -22,10 +24,11 @@ pause_on_error() {
   if [[ "$code" != "0" && "$code" != "130" && "$code" != "143" ]]; then
     printf '\n'
     warn "The launcher stopped because of an error. The terminal will stay open so you can read it."
-    if [[ -r /dev/tty ]]; then
-      read -r -p "Press Enter to close..." _ < /dev/tty || true
-    elif [[ -t 0 ]]; then
+    if [[ -t 0 ]]; then
       read -r -p "Press Enter to close..." _ || true
+    elif { exec 3</dev/tty; } 2>/dev/null; then
+      read -r -p "Press Enter to close..." _ <&3 || true
+      exec 3<&-
     else
       warn "No interactive terminal was available for the pause prompt."
     fi
@@ -90,9 +93,7 @@ ask_mode() {
 }
 
 write_default_env() {
-  local llama_dir="$1" model_path="$2" cuda="$3"
-  local ngl="0"
-  [[ "$cuda" == "true" ]] && ngl="999"
+  local llama_dir="$1" model_path="$2"
   cat > "$ENV_FILE" <<ENV
 # Created by run_all.sh
 LLAMA_BASE_URL=http://127.0.0.1:8033
@@ -100,15 +101,27 @@ LLAMA_MODEL=
 LLAMA_TEMPERATURE=0.7
 LLAMA_TOP_P=0.9
 LLAMA_MAX_TOKENS=900
+LLAMA_FINAL_MAX_TOKENS=1200
 
 # llama.cpp launcher config
 LLAMA_CPP_DIR=$llama_dir
 MODEL_PATH=$model_path
 LLAMA_HOST=127.0.0.1
 LLAMA_PORT=8033
-LLAMA_CTX=4096
-LLAMA_NGL=$ngl
-LLAMA_BUILD_CUDA=$cuda
+LLAMA_CTX=16384
+LLAMA_PARALLEL=1
+LLAMA_REASONING_BUDGET=256
+LLAMA_MODE=cuda
+# auto + fit keeps as many layers as possible in VRAM and maps the remainder
+# from the GGUF files, which is the llama.cpp equivalent of AirLLM-style
+# layer-wise memory use.
+LLAMA_CUDA_NGL=auto
+LLAMA_FIT_TARGET_MIB=1024
+LLAMA_FIT_MIN_CTX=4096
+# Kept for compatibility with older launcher configurations.
+LLAMA_BUILD_CUDA=true
+CLEAN_VRAM_BEFORE_LLAMA=true
+LLAMA_MIN_FREE_VRAM_MIB=0
 
 SEARCH_CLAW_HOST=127.0.0.1
 SEARCH_CLAW_PORT=8811
@@ -208,24 +221,16 @@ load_env() {
 configure_minimal() {
   say "Minimal Search Claw setup"
   local mode token client_id old_token old_client_id
-  local llama_dir model_path cuda_choice use_cuda
+  local llama_dir model_path
 
-  local saved_mode cuda_default saved_cuda
+  local saved_mode
   saved_mode="$(get_env_value "$RUN_ENV_FILE" LAUNCH_MODE "both")"
   mode="$(ask_mode "$saved_mode")"
 
   llama_dir="$(ask "llama.cpp install folder" "$(get_env_value "$ENV_FILE" LLAMA_CPP_DIR "$HOME/llama.cpp")")"
   model_path="$(ask "GGUF model path" "$(get_env_value "$ENV_FILE" MODEL_PATH "$HOME/models/model.gguf")")"
 
-  saved_cuda="$(get_env_value "$ENV_FILE" LLAMA_BUILD_CUDA "false")"
-  cuda_default="n"
-  [[ "$saved_cuda" == "true" ]] && cuda_default="y"
-  use_cuda="false"
-  if ask_yes_no "Compile llama.cpp with CUDA?" "$cuda_default"; then
-    use_cuda="true"
-  fi
-
-  write_default_env "$llama_dir" "$model_path" "$use_cuda"
+  write_default_env "$llama_dir" "$model_path"
 
   if [[ "$mode" == "discord" || "$mode" == "both" ]]; then
     old_token="$(get_env_value "$DISCORD_ENV_FILE" DISCORD_TOKEN "put_your_discord_bot_token_here")"
@@ -268,9 +273,10 @@ setup_node() {
 setup_llama_cpp() {
   say "llama.cpp"
   local llama_dir="${LLAMA_CPP_DIR:-$HOME/llama.cpp}"
-  local build_cuda="${LLAMA_BUILD_CUDA:-false}"
-  local cuda_flag="OFF"
-  [[ "$build_cuda" == "true" ]] && cuda_flag="ON"
+  local -a cmake_args
+
+  LLAMA_BUILD_DIR="$llama_dir/build-cuda"
+  LLAMA_SERVER_BIN="$LLAMA_BUILD_DIR/bin/llama-server"
 
   command -v git >/dev/null 2>&1 || fail "git not found. Install git first."
   command -v cmake >/dev/null 2>&1 || fail "cmake not found. Install cmake first."
@@ -283,14 +289,31 @@ setup_llama_cpp() {
     echo "Found llama.cpp in $llama_dir"
   fi
 
-  if [[ ! -x "$llama_dir/build/bin/llama-server" ]]; then
-    say "Compiling llama.cpp ($([[ "$cuda_flag" == "ON" ]] && echo CUDA || echo CPU))"
-    cmake -S "$llama_dir" -B "$llama_dir/build" -DGGML_CUDA="$cuda_flag"
-    cmake --build "$llama_dir/build" --config Release -j "$(nproc 2>/dev/null || echo 4)"
+  if [[ ! -x "$LLAMA_SERVER_BIN" ]]; then
+    say "Compiling llama.cpp (CUDA) in $LLAMA_BUILD_DIR"
+    cmake_args=(
+      -S "$llama_dir"
+      -B "$LLAMA_BUILD_DIR"
+      -DCMAKE_BUILD_TYPE=Release
+      -DBUILD_SHARED_LIBS=OFF
+      -DGGML_CUDA=ON
+      -DLLAMA_CURL=ON
+    )
+    cmake "${cmake_args[@]}"
+    cmake --build "$LLAMA_BUILD_DIR" --config Release -j "$(nproc 2>/dev/null || echo 4)" --target llama-server
   fi
 
-  [[ -x "$llama_dir/build/bin/llama-server" ]] || fail "llama-server was not built at $llama_dir/build/bin/llama-server"
+  [[ -x "$LLAMA_SERVER_BIN" ]] || fail "llama-server was not built at $LLAMA_SERVER_BIN"
+  echo "Selected llama.cpp mode: CUDA only"
+  echo "Server binary: $LLAMA_SERVER_BIN"
   [[ -f "${MODEL_PATH:-}" ]] || fail "GGUF model not found: ${MODEL_PATH:-empty}. Edit MODEL_PATH in .env or run this script again and enter the correct path."
+}
+
+require_cuda() {
+  say "Checking CUDA"
+  command -v nvidia-smi >/dev/null 2>&1 || fail "CUDA-only mode requires an NVIDIA driver, but nvidia-smi was not found."
+  nvidia-smi -L >/dev/null 2>&1 || fail "CUDA-only mode is enabled, but the NVIDIA driver cannot see a CUDA GPU. Fix the driver before starting Search Claw."
+  echo "CUDA GPU detected."
 }
 
 pid_command() {
@@ -372,6 +395,58 @@ cleanup_stale_search_claw_processes() {
   stop_matching_pids "$ROOT_DIR/discord/bridge\\.js" "old Discord bridge"
   stop_matching_pids "$ROOT_DIR/whatsapp/bridge\\.js" "old WhatsApp bridge"
   stop_matching_pids "$ROOT_DIR/whatsapp/\\.wwebjs_auth/session-searchclaw-whatsapp" "old WhatsApp browser session"
+}
+
+cuda_memory_rows() {
+  nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv,noheader,nounits 2>/dev/null || true
+}
+
+stop_stale_llama_cuda_processes() {
+  local row pid name used cmd
+  while IFS= read -r row; do
+    [[ -n "$row" ]] || continue
+    pid="${row%%,*}"
+    row="${row#*, }"
+    name="${row%%,*}"
+    used="${row##*, }"
+    cmd="$(pid_command "$pid")"
+    if [[ "$cmd" == *"llama-server"* ]]; then
+      stop_stale_pid "$pid" "old llama.cpp CUDA process using ${used} MiB VRAM"
+    elif [[ -n "$pid" ]]; then
+      warn "GPU process PID $pid ($name) is using ${used} MiB VRAM and was left running: $cmd"
+    fi
+  done < <(cuda_memory_rows)
+}
+
+cuda_free_vram_mib() {
+  nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits 2>/dev/null | head -n 1 | tr -dc '0-9' || true
+}
+
+prepare_cuda_vram() {
+  [[ "${CLEAN_VRAM_BEFORE_LLAMA:-true}" == "true" ]] || return 0
+  command -v nvidia-smi >/dev/null 2>&1 || {
+    warn "nvidia-smi not found; cannot inspect or wait for CUDA VRAM cleanup."
+    return 0
+  }
+
+  say "Preparing CUDA VRAM"
+  stop_stale_llama_cuda_processes
+
+  local i free min_free
+  min_free="${LLAMA_MIN_FREE_VRAM_MIB:-0}"
+  for i in {1..20}; do
+    free="$(cuda_free_vram_mib)"
+    [[ -z "$free" || "$min_free" == "0" || "$free" -ge "$min_free" ]] && break
+    sleep 0.5
+  done
+
+  nvidia-smi --query-gpu=name,memory.used,memory.free,memory.total --format=csv,noheader 2>/dev/null || true
+  if [[ "${min_free:-0}" != "0" ]]; then
+    free="$(cuda_free_vram_mib)"
+    if [[ -n "$free" && "$free" -lt "$min_free" ]]; then
+      warn "Only ${free} MiB VRAM is free; LLAMA_MIN_FREE_VRAM_MIB is ${min_free} MiB."
+    fi
+  fi
 }
 
 safe_log_name() {
@@ -530,10 +605,19 @@ else
   fi
 fi
 
-setup_python
-fix_discord_token_prefix
 load_env "$ENV_FILE"
 load_env "$RUN_ENV_FILE"
+require_cuda
+setup_python
+fix_discord_token_prefix
+LLAMA_RUNTIME_MODE=cuda
+LLAMA_NGL="${LLAMA_CUDA_NGL:-auto}"
+LLAMA_FIT_TARGET_MIB="${LLAMA_FIT_TARGET_MIB:-1024}"
+LLAMA_FIT_MIN_CTX="${LLAMA_FIT_MIN_CTX:-4096}"
+LLAMA_PARALLEL="${LLAMA_PARALLEL:-1}"
+LLAMA_REASONING_BUDGET="${LLAMA_REASONING_BUDGET:-256}"
+export LLAMA_RUNTIME_MODE
+export LLAMA_NGL
 setup_llama_cpp
 cleanup_stale_search_claw_processes
 
@@ -561,7 +645,8 @@ case "${LAUNCH_MODE:-both}" in
   *) fail "Unknown LAUNCH_MODE in .run_all.env. Delete it and run again." ;;
 esac
 
-start_process "llama.cpp LLM server" "'$LLAMA_CPP_DIR/build/bin/llama-server' -m '$MODEL_PATH' -c '${LLAMA_CTX:-4096}' -ngl '${LLAMA_NGL:-0}' --host '${LLAMA_HOST:-127.0.0.1}' --port '${LLAMA_PORT:-8033}'" "log_only"
+prepare_cuda_vram
+start_process "llama.cpp LLM server" "'$LLAMA_SERVER_BIN' -m '$MODEL_PATH' -c '${LLAMA_CTX:-16384}' -np '$LLAMA_PARALLEL' -ngl '${LLAMA_NGL:-auto}' --reasoning-budget '$LLAMA_REASONING_BUDGET' --fit on --fit-target '$LLAMA_FIT_TARGET_MIB' --fit-ctx '$LLAMA_FIT_MIN_CTX' --mmap --host '${LLAMA_HOST:-127.0.0.1}' --port '${LLAMA_PORT:-8033}'" "log_only"
 wait_for_llama_ready
 
 start_process "Search Claw Python server" "cd '$ROOT_DIR' && source '$VENV_DIR/bin/activate' && set -a && source '$ENV_FILE' && set +a && python searchClaw.py --server --host '${SEARCH_CLAW_HOST:-127.0.0.1}' --port '${SEARCH_CLAW_PORT:-8811}'; deactivate || true"

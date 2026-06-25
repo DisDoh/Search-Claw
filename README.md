@@ -514,7 +514,7 @@ The easiest way to start Search Claw on Linux/macOS is the simplified launcher. 
 - installs Python requirements
 - checks for `llama.cpp` in your home folder, for example `~/llama.cpp`
 - if `llama.cpp` is missing, clones it into your home folder
-- compiles `llama.cpp` in CPU mode or CUDA mode
+- keeps separate `llama.cpp` CPU and CUDA builds and lets you choose one at launch
 - starts the `llama-server`
 - starts the Search Claw Python server
 - starts Discord, WhatsApp, or both
@@ -533,7 +533,7 @@ On the first run, it asks only the minimum needed. Every prompt shows a default 
 - `3` = launch both
 - where to install/find `llama.cpp`, default: `~/llama.cpp`
 - your `.gguf` model path, for example `~/models/ColdBrew-Lucid.Q4_K_M.gguf`
-- whether to compile `llama.cpp` with CUDA
+- a working NVIDIA CUDA GPU (the launcher is CUDA-only)
 - Discord bot token, only if Discord is selected
 - Discord Application ID / Client ID, only if Discord is selected
 
@@ -569,8 +569,10 @@ LLAMA_BASE_URL=http://127.0.0.1:8033
 LLAMA_CPP_DIR=$HOME/llama.cpp
 MODEL_PATH=$HOME/models/model.gguf
 LLAMA_CTX=4096
-LLAMA_NGL=0          # CPU mode
-LLAMA_NGL=999        # CUDA mode
+LLAMA_MODE=cuda
+LLAMA_CUDA_NGL=auto
+LLAMA_FIT_TARGET_MIB=1024
+LLAMA_FIT_MIN_CTX=4096
 SEARCH_CLAW_PORT=8811
 MAX_OPEN_PAGES=5
 CHAT_HISTORY_LIMIT=6
@@ -578,7 +580,11 @@ CHAT_PREFIX=!
 SEARCH_PREFIX=?
 ```
 
-If you choose CUDA, make sure your NVIDIA driver and CUDA toolkit are already installed. If the CUDA build fails, run the launcher again, choose not to reuse the saved config, then answer `n` for CUDA to build CPU mode.
+The launcher now uses CUDA exclusively and builds only `~/llama.cpp/build-cuda/`. It stops with a clear error if the NVIDIA driver cannot expose a CUDA GPU.
+
+`LLAMA_CUDA_NGL=auto` and llama.cpp's `--fit` mode automatically keep as many layers as possible in VRAM while preserving the configured safety margin. Remaining model data stays memory-mapped from the GGUF files instead of requiring a second full copy in RAM. This is the GGUF/llama.cpp equivalent of AirLLM's layer-wise low-memory approach. Keep `--mmap` enabled for models close to or larger than available system RAM.
+
+`LLAMA_FIT_TARGET_MIB` controls the VRAM safety margin. Increase it if other programs share the GPU. `LLAMA_FIT_MIN_CTX` is the minimum context size that automatic fitting may consider.
 
 If `llama-server` fails at startup, the launcher no longer closes immediately. It keeps the terminal open, shows the last error lines, and saves logs in:
 
@@ -593,7 +599,7 @@ Common `llama.cpp` startup errors are a wrong `.gguf` model path, a model that n
 
 The Python server runs inside `.venv`. When you press `Ctrl+C`, the launcher stops the llama.cpp server, Search Claw, Discord/WhatsApp, and deactivates the virtual environment.
 
-On later runs, it asks whether to reuse the saved launcher config. Press Enter for yes. Choose `n` only when you want to change Discord/WhatsApp mode, model path, llama.cpp location, or CUDA/CPU mode. When reconfiguring, pressing Enter on any individual prompt keeps the already proposed value.
+On later runs, it asks whether to reuse the saved launcher config. Press Enter for yes. Choose `n` only when you want to change Discord/WhatsApp mode, model path, or the llama.cpp location.
 
 ## Troubleshooting
 
@@ -650,12 +656,12 @@ If it fails, restart `llama-server` and check the model path.
 
 ### CUDA out of memory
 
-Try one or more of these:
+The launcher normally prevents this with `LLAMA_CUDA_NGL=auto` and `--fit`.
 
-- Lower `-ngl`, for example `-ngl 40`
-- Lower context size, for example `-c 2048`
-- Use a smaller quantization such as `Q4_K_M`
-- Use a smaller model
+- Increase `LLAMA_FIT_TARGET_MIB`, for example to `2048`.
+- Lower `LLAMA_CTX`, for example to `2048`.
+- Stop other GPU applications.
+- Use a smaller quantization or model if even the minimum working set cannot fit.
 
 ---
 
